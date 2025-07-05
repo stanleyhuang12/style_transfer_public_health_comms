@@ -14,6 +14,7 @@ import fitz
 import re
 from transformers import BertTokenizerFast, BertForTokenClassification
 import torch
+from selenium.webdriver.common.by import By
 
 import pandas as pd
 
@@ -80,6 +81,81 @@ def parse_javascript_body(url, dom_type, driver=driver1, **kwargs):
     return driver_object
 
 
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException
+
+def parse_javascript_body_bt(
+    url,
+    dom_type,
+    driver,
+    button_selector=None,
+    max_clicks=20,
+    sleep_time=1.5,
+    **kwargs
+):
+    """
+    Loads a JavaScript-heavy page using Selenium, clicks a button repeatedly if specified,
+    scrolls down to load all content, then parses and returns text + URLs for specified DOM elements.
+
+    Args:
+        url (str): The URL of the page to load.
+        dom_type (str): The tag name of the elements to extract (e.g., 'div', 'p').
+        driver (WebDriver): A Selenium WebDriver instance.
+        button_selector (tuple): A tuple like (By.CLASS_NAME, 'load-more') to find the button.
+        max_clicks (int): Max number of button clicks to attempt.
+        sleep_time (float): Delay between clicks and scrolls.
+        **kwargs: Passed directly to BeautifulSoup's `find_all`.
+
+    Returns:
+        list[dict]: List of {'text': ..., 'urls': [...]} dictionaries.
+    """
+
+    try:
+        driver.get(url)
+    except Exception as e:
+        print(f'[ERROR] Failed to load URL: {e}')
+        return None
+
+    if button_selector:
+        for i in range(max_clicks):
+            try:
+                button = driver.find_element(*button_selector)
+                driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                time.sleep(0.5)
+                button.click()
+                print(f"[INFO] Clicked button {i + 1} time(s).")
+                time.sleep(sleep_time)
+            except (NoSuchElementException, ElementClickInterceptedException) as e:
+                print(f"[INFO] Button click stopped at attempt {i + 1}: {e}")
+                break
+            except Exception as e:
+                print(f"[WARN] Unexpected error on click {i + 1}: {e}")
+                break
+
+    current_height = 0
+    scroll_step = 600
+    end_height = driver.execute_script("return document.body.scrollHeight")
+
+    while current_height <= end_height:
+        driver.execute_script(f"window.scrollTo(0, {current_height})")
+        time.sleep(sleep_time)
+        current_height += scroll_step
+        end_height = driver.execute_script("return document.body.scrollHeight")
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    elements = soup.find_all(dom_type, **kwargs)
+
+    results = []
+    for el in elements:
+        text = el.get_text(strip=True)
+        links = [a['href'] for a in el.find_all('a', href=True)]
+        results.append({'text': text, 'urls': links})
+
+    print(f"[INFO] Extracted {len(results)} element(s).")
+    return results
+        
+        
+
 def multi_page_scrape(url, num, dom_header_type, **kwargs): 
     match = re.search(r"(\d+)(?=\D*$)", url)
     scraped_urls = []
@@ -92,6 +168,7 @@ def multi_page_scrape(url, num, dom_header_type, **kwargs):
     if match: 
         page_number = match.group(1)
         print(url)
+        time.sleep(2)
         secondary_urls, secondary_texts = complete_text_url_extraction(url, dom_header_type=dom_header_type, **kwargs)
         
         if secondary_urls: 
@@ -117,7 +194,7 @@ def multi_page_scrape(url, num, dom_header_type, **kwargs):
 
 
 
-def complete_text_url_extraction(url: str, dom_header_type: str, driver=driver1, **kwargs): 
+def complete_text_url_extraction(url: str, dom_header_type: str, driver=driver1, button_selector=None, **kwargs): 
     """Takes a URL, html_elements, and additional parameters like style, class, id and scrapes all the nested text 
     and URLs. Returns all the relevant texts and list of URLs. 
 
@@ -148,8 +225,11 @@ def complete_text_url_extraction(url: str, dom_header_type: str, driver=driver1,
     
     if header is None:
             print(f'Trying to scrape via Selenium because requests was blocked.')
-            header = parse_javascript_body(url, dom_header_type, driver=driver, **kwargs)
-        
+            if button_selector: 
+                header = parse_javascript_body_bt(url, dom_header_type, driver=driver, button_selector=button_selector)
+            else: 
+                header = parse_javascript_body(url, dom_header_type, driver=driver, **kwargs)
+
             if header is None: 
                 print(f"Could not find {dom_header_type} with {kwargs} on {url}")
                 
@@ -216,12 +296,16 @@ def text_extract_for_word_docs(url_docx):
 def text_extract_for_pdfs(url_pdfs):
     response = requests.get(url_pdfs)
     if response.ok:
-        with io.BytesIO(response.content) as pdf_stream:
-            doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
-            if doc.page_count > 30:
-                print("Document with more than 30 pages", url_pdfs)
-                return None
-            return '\n'.join(page.get_text() for page in doc)
+        try: 
+            with io.BytesIO(response.content) as pdf_stream:
+                doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
+                if doc.page_count > 30:
+                    print("Document with more than 30 pages", url_pdfs)
+                    return None
+                return '\n'.join(page.get_text() for page in doc)
+        except Exception as e: 
+            print(f'Exception: {e} for {url_pdfs} ')
+            return None 
     else:
         print(f"Failed to retrieve PDF. Status code: {response.status_code}")
         return None
@@ -247,7 +331,7 @@ def text_extract_for_pdfs(url_pdfs):
 
 
 # The first step is to handle non-HTML website items 
-def url_validation(url_list: List[str], base_url: Optional[str] = None): 
+def url_validation(url_list: List[str], base_url: Optional[str] = None, driver=None): 
     
     http_start = ('https://', 'http://')
     
@@ -276,9 +360,15 @@ def url_validation(url_list: List[str], base_url: Optional[str] = None):
                 if response.ok: 
                     validated_url_list.append(response.url) ## I put .url so that it can detect redirected pages
                     continue 
+                else: 
+                    driver.get(joined_url)
+                    if "404" in driver.title or "Not Found" in driver.page_source:
+                        print("❌ Page might not have loaded correctly")
+                    else:
+                        print("✅ Page loaded")
+                        validated_url_list.append(driver.current_url)
             except requests.RequestException:
                 pass
-            
             
             ## Try 2
             inherited_with_path = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
@@ -288,6 +378,13 @@ def url_validation(url_list: List[str], base_url: Optional[str] = None):
                 if response.ok:
                     validated_url_list.append(response.url)
                     continue
+                else: 
+                    driver.get(joined_url)
+                    if "404" in driver.title or "Not Found" in driver.page_source:
+                        print("Page might not have loaded correctly")
+                    else:
+                        print("Page loaded")
+                        validated_url_list.append(driver.current_url)
             except requests.RequestException:
                 pass
 
@@ -297,8 +394,6 @@ def url_validation(url_list: List[str], base_url: Optional[str] = None):
             pass 
         
     return validated_url_list if validated_url_list else None 
-
-
 
 
 
@@ -364,7 +459,7 @@ def url_validation(url_list: List[str], base_url: Optional[str] = None):
     
 
 
-def handle_downloadable_websites(url): 
+def handle_downloadable_websites(url, force_img=False, force_pdf=False, force_text=False): 
     converted_texts = None
     image_ext = ('.img', '.png', '.jpg', '.jpeg')
     file_ext = ('.txt', '.pdf')
@@ -374,13 +469,13 @@ def handle_downloadable_websites(url):
         return None 
     
     url_lower = url.lower()
-    if url_lower.endswith(image_ext): 
+    if url_lower.endswith(image_ext) or force_img: 
         print('Extracting texts from images.')
         converted_texts = ocr_extract_for_images(url)
-    elif url_lower.endswith(file_ext): 
+    elif url_lower.endswith(file_ext) or force_pdf: 
         print('Extracting text from PDFs.')
         converted_texts = text_extract_for_pdfs(url)
-    elif url_lower.endswith(docs_ext):
+    elif url_lower.endswith(docs_ext) or force_text:
         print('Extracting text from Word documents.')
         converted_texts = text_extract_for_word_docs(url)
     else: 
@@ -513,13 +608,20 @@ def see_internal_comp(document, tokenizer=bert_tokenizer, chunk_size=512, model=
 
 
 def brute_remove_entities(document): 
-    entities_list = ['Austin', 'Texas', 'TX', 'Dallas', 'San Antonio', 'Houston', 'El Paso', 'Arlington', 'Texan', 'Texans']
+    entities_list = ['Austin', 'Texas', 'TX', 'Dallas', 'San Antonio', 'Houston', 'El Paso', 'Arlington', 'Texan', 'Texans', 
+                     "TEXAS", "AUSTIN", "MASSACHUSETTS", "Texan"
+                     'Massachusetts', 'MA', 'New England']
     
-    for entity in entities_list: 
-        document = document.replace(entity, '[PAD]')
-    
+    if document: 
+        for entity in entities_list: 
+            document = document.replace(entity, '[PAD]')
+    else: 
+        return None 
     return document 
-    
+
+
+## Apply zero-shot extraction of frames 
+
 # def remove_entities_inference(document, tokenizer=bert_tokenizer, model=ner_model, chunk_size=512):
 #     # Tokenize entire document
 #     document = document.replace('\n', ' ')
@@ -640,6 +742,7 @@ remove_entities_inference(text)
 
 
     
-    
+chained_ner = chain_func(brute_remove_entities, remove_entities_inference)
+
     
     
